@@ -1,29 +1,66 @@
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from jose import jwt
-import time, uuid
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+import time, uuid, base64
 
 app = FastAPI()
 
-# 临时存储 code -> user
+# -------------------------
+# 模拟数据库 / 配置
+# -------------------------
 authorization_codes = {}
 access_tokens = {}
 
-# 假用户数据库
 users = {"alice": {"sub": "1", "name": "Alice", "email": "alice@example.com"}}
 
 CLIENT_ID = "my-client-id"
 CLIENT_SECRET = "my-client-secret"
 REDIRECT_URI = "http://localhost:8000/callback"
-JWT_SECRET = "super-secret-key"
 
+# -------------------------
+# RSA 密钥对 (用于签发 id_token)
+# -------------------------
+private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+public_key = private_key.public_key()
+
+private_pem = private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption()
+)
+
+public_pem = public_key.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
+
+# 生成 JWKS (JSON Web Key Set)
+def generate_jwks():
+    numbers = public_key.public_numbers()
+    e = base64.urlsafe_b64encode(numbers.e.to_bytes(3, "big")).decode().rstrip("=")
+    n = base64.urlsafe_b64encode(numbers.n.to_bytes(256, "big")).decode().rstrip("=")
+    return {
+        "keys": [{
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "kid": "my-key-id",
+            "n": n,
+            "e": e
+        }]
+    }
+
+# -------------------------
 # 1. Authorization Endpoint
+# -------------------------
 @app.get("/authorize")
 def authorize(response_type: str, client_id: str, redirect_uri: str, scope: str, state: str):
     if client_id != CLIENT_ID:
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
-    # 假设用户已经登录
+    # 假设用户已登录 (Alice)
     user = users["alice"]
 
     code = str(uuid.uuid4())
@@ -31,8 +68,9 @@ def authorize(response_type: str, client_id: str, redirect_uri: str, scope: str,
 
     return RedirectResponse(f"{redirect_uri}?code={code}&state={state}")
 
-
+# -------------------------
 # 2. Token Endpoint
+# -------------------------
 @app.post("/token")
 def token(grant_type: str, code: str, client_id: str, client_secret: str, redirect_uri: str):
     if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
@@ -44,11 +82,23 @@ def token(grant_type: str, code: str, client_id: str, client_secret: str, redire
     user = authorization_codes.pop(code)
 
     access_token = str(uuid.uuid4())
+
+    now = int(time.time())
     id_token = jwt.encode(
-        {"sub": user["sub"], "name": user["name"], "iat": int(time.time())},
-        JWT_SECRET,
-        algorithm="HS256"
+        {
+            "iss": "http://localhost:8000",
+            "sub": user["sub"],
+            "aud": client_id,
+            "exp": now + 3600,
+            "iat": now,
+            "name": user["name"],
+            "email": user["email"],
+        },
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": "my-key-id"}
     )
+
     access_tokens[access_token] = user
 
     return {
@@ -58,8 +108,9 @@ def token(grant_type: str, code: str, client_id: str, client_secret: str, redire
         "expires_in": 3600
     }
 
-
+# -------------------------
 # 3. UserInfo Endpoint
+# -------------------------
 @app.get("/userinfo")
 def userinfo(request: Request):
     auth = request.headers.get("Authorization")
@@ -71,6 +122,29 @@ def userinfo(request: Request):
         return JSONResponse({"error": "invalid_token"}, status_code=401)
 
     return access_tokens[token]
+
+# -------------------------
+# 4. JWKS Endpoint
+# -------------------------
+@app.get("/jwks.json")
+def jwks():
+    return generate_jwks()
+
+# -------------------------
+# 5. Discovery Endpoint
+# -------------------------
+@app.get("/.well-known/openid-configuration")
+def discovery():
+    return {
+        "issuer": "http://localhost:8000",
+        "authorization_endpoint": "http://localhost:8000/authorize",
+        "token_endpoint": "http://localhost:8000/token",
+        "userinfo_endpoint": "http://localhost:8000/userinfo",
+        "jwks_uri": "http://localhost:8000/jwks.json",
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+    }
 
 
 
